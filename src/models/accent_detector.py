@@ -240,7 +240,10 @@ class AccentDetector:
                 
                 # Classify accent
                 accent, confidence, explanation = self._classify_accent(features, audio_data, sample_rate, language_probs)
-            
+            # Add to detect_accent method
+            if hasattr(self, 'using_fallback') and self.using_fallback:
+                logger.warning("Using fallback mode for accent detection - reduced accuracy expected")
+
             result = {
                 "accent": accent,
                 "confidence_score": confidence,
@@ -304,7 +307,7 @@ class AccentDetector:
                 english_prob = 0.0
                 for lang, score in language_score_dict.items():
                     if lang.startswith("en"):
-                        english_prob += score / 100.0  # Convert back to 0-1 scale for calculation
+                        english_prob = max(0.0, min(100.0, language_scores[0][english_idx].item() * 100))  # Convert back to 0-1 scale for calculation
                 
                 # Get probabilities for common non-English languages
                 non_english_probs = {}
@@ -561,46 +564,67 @@ class AccentDetector:
         try:
             # Extract basic features
             # MFCC features
+            # Extract basic features
             mfccs = librosa.feature.mfcc(y=audio_data, sr=sample_rate, n_mfcc=13)
             mfcc_mean = np.mean(mfccs, axis=1)
             
-            # Spectral features
-            spectral_centroid = librosa.feature.spectral_centroid(y=audio_data, sr=sample_rate)
-            spectral_mean = np.mean(spectral_centroid)
+            # Use a more balanced approach
+            accent_scores = {
+                "American": 0,
+                "British": 0,
+                "Australian": 0,
+                "Indian": 0,
+                "Canadian": 0,
+                "Irish": 0
+            }
             
-            # Zero crossing rate (proxy for speech rate)
+            # Add points based on different features
             zcr = librosa.feature.zero_crossing_rate(audio_data)
             speech_rate = np.mean(zcr)
             
-            # Check for speech activity
-            speech_activity = np.mean(np.abs(audio_data)) > 0.01
-            
-            # For YouTube videos, assume English with high probability if there's speech
-            if not speech_activity:
-                return "Non-English", 30.0, "Insufficient speech detected for accent analysis."
-            
-            # Very simplified classification based on basic features
-            if speech_rate > 0.06:
-                accent = "American"
-                explanation = "Detected faster speech patterns typical of American English (fallback mode)."
-            elif spectral_mean > 2000:
-                accent = "British"
-                explanation = "Detected tonal qualities typical of British English (fallback mode)."
+            # Speech rate influences
+            if speech_rate > 0.07:
+                accent_scores["American"] += 2
+                accent_scores["Canadian"] += 1
+            elif speech_rate > 0.05:
+                accent_scores["British"] += 1
+                accent_scores["Australian"] += 1
             else:
-                accent = "Neutral English"
-                explanation = "Detected standard English speech patterns (fallback mode)."
+                accent_scores["Indian"] += 1
+                accent_scores["Irish"] += 1
             
-            # Lower confidence in fallback mode
-            confidence = 60.0
+            # MFCC influences (simplified)
+            if mfcc_mean[1] > 0:
+                accent_scores["American"] += 1
+            else:
+                accent_scores["Canadian"] += 1
+                
+            if mfcc_mean[2] > 0:
+                accent_scores["British"] += 1
+            else:
+                accent_scores["Australian"] += 1
+                
+            if mfcc_mean[0] > 0:
+                accent_scores["Indian"] += 1
+            else:
+                accent_scores["Irish"] += 1
             
-            return accent, confidence, explanation + " Note: Using simplified detection due to model initialization issues."
+            # Find accent with highest score
+            accent = max(accent_scores.items(), key=lambda x: x[1])[0]
             
+            # Calculate confidence (normalized score)
+            max_score = max(accent_scores.values())
+            total_score = sum(accent_scores.values())
+            confidence = (max_score / total_score) * 70 if total_score > 0 else 50
+            
+            explanation = f"Basic accent classification based on speech patterns (fallback mode)."
+            
+            return accent, confidence, explanation
         except Exception as e:
             logger.error(f"Error in fallback classification: {str(e)}")
             
             # Return a very basic result
             return "English", 50.0, "Basic classification only. Full accent detection unavailable due to technical issues."
-
 
 # Example usage
 if __name__ == "__main__":
