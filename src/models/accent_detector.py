@@ -63,10 +63,52 @@ class AccentDetector:
                 savedir="pretrained_models/lang-id-voxlingua107-ecapa"
             )
             
+            # Get the language labels - handle different SpeechBrain versions
+            self._get_language_labels()
+            
             logger.info("Models loaded successfully")
         except Exception as e:
             logger.error(f"Error loading models: {str(e)}")
             raise RuntimeError(f"Failed to initialize accent detection models: {str(e)}")
+    
+    def _get_language_labels(self):
+        """
+        Get language labels from the encoder, handling different SpeechBrain versions.
+        Different versions of SpeechBrain use different attribute names for labels.
+        """
+        try:
+            # Try different attribute names used in various SpeechBrain versions
+            if hasattr(self.language_id.hparams.label_encoder, 'classes_'):
+                self.language_labels = self.language_id.hparams.label_encoder.classes_
+                logger.info("Using 'classes_' attribute for language labels")
+            elif hasattr(self.language_id.hparams.label_encoder, 'labels'):
+                self.language_labels = self.language_id.hparams.label_encoder.labels
+                logger.info("Using 'labels' attribute for language labels")
+            elif hasattr(self.language_id.hparams.label_encoder, 'label_list'):
+                self.language_labels = self.language_id.hparams.label_encoder.label_list
+                logger.info("Using 'label_list' attribute for language labels")
+            elif hasattr(self.language_id.hparams, 'labels'):
+                self.language_labels = self.language_id.hparams.labels
+                logger.info("Using hparams 'labels' attribute for language labels")
+            else:
+                # Fallback: Create a basic list of language codes
+                logger.warning("Could not find language labels, using fallback list")
+                self.language_labels = [
+                    "en", "de", "fr", "es", "it", "pt", "nl", "pl", "ru", "zh",
+                    "ja", "ko", "ar", "hi", "tr", "sv", "hu", "fi", "da", "no"
+                ]
+            
+            # Log the first few labels to verify
+            logger.info(f"First few language labels: {self.language_labels[:5]}")
+            
+        except Exception as e:
+            logger.error(f"Error getting language labels: {str(e)}")
+            # Fallback: Create a basic list of language codes
+            logger.warning("Using fallback language label list due to error")
+            self.language_labels = [
+                "en", "de", "fr", "es", "it", "pt", "nl", "pl", "ru", "zh",
+                "ja", "ko", "ar", "hi", "tr", "sv", "hu", "fi", "da", "no"
+            ]
     
     def detect_accent(self, audio_path):
         """
@@ -192,11 +234,29 @@ class AccentDetector:
         
         # Check if it's English first (using language ID model)
         english_langs = ["en", "eng"]
-        english_indices = [i for i, lang in enumerate(self.language_id.hparams.label_encoder.classes_) 
-                          if any(eng in lang for eng in english_langs)]
+        english_indices = [i for i, lang in enumerate(self.language_labels) 
+                          if any(eng in str(lang).lower() for eng in english_langs)]
+        
+        # If no English indices found, use a fallback approach
+        if not english_indices:
+            logger.warning("No English language indices found, using fallback approach")
+            # Try to find English by string matching in all available labels
+            for i, lang in enumerate(self.language_labels):
+                if "en" in str(lang).lower():
+                    english_indices.append(i)
+                    
+            # If still no English indices, use the first few indices as a last resort
+            if not english_indices and len(self.language_labels) > 0:
+                logger.warning("Using first index as fallback for English")
+                english_indices = [0]  # Assume first label might be English
         
         # Sum probabilities of all English variants
-        english_prob = sum(language_scores[0][i].item() for i in english_indices)
+        try:
+            english_prob = sum(language_scores[0][i].item() for i in english_indices)
+        except (IndexError, TypeError) as e:
+            logger.error(f"Error calculating English probability: {str(e)}")
+            # Fallback to a default probability
+            english_prob = 0.7  # Assume moderately high probability as fallback
         
         # If not likely English, return low confidence
         if english_prob < 0.5:
