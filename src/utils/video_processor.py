@@ -91,9 +91,17 @@ class VideoProcessor:
             output_path = self.output_dir / f"video{Path(url).suffix}"
             
             ydl_opts = {
-                'format': 'best',
+                'format': 'bestaudio[ext=m4a]/best[ext=mp4]/best',
                 'outtmpl': str(output_path),
-                'quiet': True,
+                'quiet': False,  # Set to False for more verbose output during debugging
+                'noplaylist': True,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'wav',
+                    'preferredquality': '192',
+                }],
+                'ignoreerrors': True,  # Continue on download errors
+                'no_warnings': False,  # Show warnings for debugging
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -104,15 +112,72 @@ class VideoProcessor:
         # For platform URLs (YouTube, Vimeo, Loom, etc.)
         output_path = self.output_dir / "video.mp4"
         
+        # Try multiple format options with fallbacks
         ydl_opts = {
-            'format': 'best',
+            'format': 'bestaudio[ext=m4a]/best[ext=mp4]/best',  # Prioritize audio formats, then video
             'outtmpl': str(output_path),
-            'quiet': True,
+            'quiet': False,  # Set to False for more verbose output during debugging
+            'noplaylist': True,
+            'ignoreerrors': True,  # Continue on download errors
+            'no_warnings': False,  # Show warnings for debugging
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'wav',
+                'preferredquality': '192',
+            }],
         }
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+                
+            # Check if the file was downloaded successfully
+            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                # If the file doesn't exist or is empty, try direct audio extraction
+                logger.info("Video download failed, trying direct audio extraction...")
+                audio_output_path = self.output_dir / "audio.wav"
+                
+                audio_ydl_opts = {
+                    'format': 'bestaudio/best',
+                    'outtmpl': str(self.output_dir / "audio"),
+                    'quiet': False,
+                    'noplaylist': True,
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'wav',
+                        'preferredquality': '192',
+                    }],
+                    'ignoreerrors': False,
+                }
+                
+                with yt_dlp.YoutubeDL(audio_ydl_opts) as ydl:
+                    ydl.download([url])
+                
+                # Check for the extracted audio file
+                audio_files = list(self.output_dir.glob("audio.wav"))
+                if audio_files:
+                    return str(audio_files[0])
+                else:
+                    raise RuntimeError("Failed to extract audio directly")
+        except Exception as e:
+            logger.error(f"Error downloading with primary options: {str(e)}")
+            
+            # Try with simpler options as a last resort
+            logger.info("Trying fallback download options...")
+            fallback_ydl_opts = {
+                'format': 'worstaudio/worst',  # Try worst quality as a last resort
+                'outtmpl': str(output_path),
+                'quiet': False,
+                'noplaylist': True,
+            }
+            
+            with yt_dlp.YoutubeDL(fallback_ydl_opts) as ydl:
+                ydl.download([url])
         
+        # Check if any file was downloaded
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise RuntimeError("Failed to download video after multiple attempts")
+            
         return str(output_path)
     
     def _extract_audio(self, video_path):
@@ -144,7 +209,20 @@ class VideoProcessor:
             
         except ffmpeg.Error as e:
             logger.error(f"FFmpeg error: {e.stderr.decode() if e.stderr else str(e)}")
-            raise RuntimeError(f"Failed to extract audio: {str(e)}")
+            
+            # Try alternative approach with simpler options
+            try:
+                logger.info("Trying alternative audio extraction approach...")
+                os.system(f'ffmpeg -i "{video_path}" -vn -acodec pcm_s16le -ar 16000 -ac 1 "{audio_path}" -y')
+                
+                if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+                    logger.info(f"Audio extracted successfully using alternative approach to: {audio_path}")
+                    return audio_path
+                else:
+                    raise RuntimeError("Alternative audio extraction failed")
+            except Exception as alt_e:
+                logger.error(f"Alternative extraction error: {str(alt_e)}")
+                raise RuntimeError(f"Failed to extract audio: {str(e)}")
 
 
 # Example usage
