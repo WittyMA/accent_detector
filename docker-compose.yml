@@ -1,0 +1,14 @@
+# Docker Compose file for Accent Detection System
+version: '3'
+
+services:
+  accent-detector:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./src:/app/src
+      - ./pretrained_models:/app/pretrained_models
+    environment:
+      - PYTHONPATH=/app
+    restart: unless-stopped
