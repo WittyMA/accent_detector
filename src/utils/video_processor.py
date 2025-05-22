@@ -1,6 +1,6 @@
 """
 Video processing utilities for accent detection system.
-Handles video URL input and audio extraction.
+Handles video URL input and audio extraction with proxy service support.
 """
 
 import os
@@ -9,13 +9,17 @@ import logging
 from pathlib import Path
 import yt_dlp
 import ffmpeg
+import requests
+import json
+import re
+import urllib.parse
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class VideoProcessor:
-    """Class to handle video URL input and audio extraction."""
+    """Class to handle video URL input and audio extraction using proxy services."""
     
     def __init__(self, output_dir=None):
         """
@@ -74,7 +78,7 @@ class VideoProcessor:
     
     def _download_or_get_video(self, url):
         """
-        Download video from URL or get direct file path.
+        Download video from URL or get direct file path using proxy services when needed.
         
         Args:
             url (str): Video URL.
@@ -93,15 +97,8 @@ class VideoProcessor:
             ydl_opts = {
                 'format': 'bestaudio[ext=m4a]/best[ext=mp4]/best',
                 'outtmpl': str(output_path),
-                'quiet': False,  # Set to False for more verbose output during debugging
+                'quiet': False,
                 'noplaylist': True,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'wav',
-                    'preferredquality': '192',
-                }],
-                'ignoreerrors': True,  # Continue on download errors
-                'no_warnings': False,  # Show warnings for debugging
             }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -109,76 +106,334 @@ class VideoProcessor:
             
             return str(output_path)
         
-        # For platform URLs (YouTube, Vimeo, Loom, etc.)
+        # For YouTube URLs, try multiple approaches
         output_path = self.output_dir / "video.mp4"
         
-        # Try multiple format options with fallbacks
-        ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/best[ext=mp4]/best',  # Prioritize audio formats, then video
-            'outtmpl': str(output_path),
-            'quiet': False,  # Set to False for more verbose output during debugging
-            'noplaylist': True,
-            'ignoreerrors': True,  # Continue on download errors
-            'no_warnings': False,  # Show warnings for debugging
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'wav',
-                'preferredquality': '192',
-            }],
-        }
-        
+        # First attempt: Try standard yt-dlp download
         try:
+            logger.info("Attempting standard download")
+            ydl_opts = {
+                'format': 'bestaudio[ext=m4a]/best[ext=mp4]/best',
+                'outtmpl': str(output_path),
+                'quiet': False,
+                'noplaylist': True,
+                'ignoreerrors': True,
+            }
+            
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
                 
             # Check if the file was downloaded successfully
-            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-                # If the file doesn't exist or is empty, try direct audio extraction
-                logger.info("Video download failed, trying direct audio extraction...")
-                audio_output_path = self.output_dir / "audio.wav"
-                
-                audio_ydl_opts = {
-                    'format': 'bestaudio/best',
-                    'outtmpl': str(self.output_dir / "audio"),
-                    'quiet': False,
-                    'noplaylist': True,
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'wav',
-                        'preferredquality': '192',
-                    }],
-                    'ignoreerrors': False,
-                }
-                
-                with yt_dlp.YoutubeDL(audio_ydl_opts) as ydl:
-                    ydl.download([url])
-                
-                # Check for the extracted audio file
-                audio_files = list(self.output_dir.glob("audio.wav"))
-                if audio_files:
-                    return str(audio_files[0])
-                else:
-                    raise RuntimeError("Failed to extract audio directly")
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                logger.info("Standard download successful")
+                return str(output_path)
         except Exception as e:
-            logger.error(f"Error downloading with primary options: {str(e)}")
+            logger.warning(f"Standard download failed: {str(e)}")
+        
+        # Second attempt: Try using a proxy service
+        try:
+            logger.info("Attempting download via proxy service")
             
-            # Try with simpler options as a last resort
-            logger.info("Trying fallback download options...")
-            fallback_ydl_opts = {
-                'format': 'worstaudio/worst',  # Try worst quality as a last resort
-                'outtmpl': str(output_path),
-                'quiet': False,
-                'noplaylist': True,
-            }
+            # Extract video ID from YouTube URL
+            video_id = self._extract_youtube_id(url)
+            if not video_id:
+                raise ValueError("Could not extract YouTube video ID")
+                
+            # Try multiple proxy services
+            proxy_methods = [
+                self._download_via_invidious,
+                self._download_via_y2mate,
+                self._download_via_alternative_domain
+            ]
             
-            with yt_dlp.YoutubeDL(fallback_ydl_opts) as ydl:
-                ydl.download([url])
+            for method in proxy_methods:
+                try:
+                    result = method(video_id, output_path)
+                    if result and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                        logger.info(f"Proxy download successful using {method.__name__}")
+                        return str(output_path)
+                except Exception as proxy_e:
+                    logger.warning(f"{method.__name__} failed: {str(proxy_e)}")
+                    continue
+                    
+            # If all proxy methods failed, try direct audio URL
+            audio_path = self.output_dir / "audio.wav"
+            if self._download_direct_audio_url(video_id, audio_path):
+                return str(audio_path)
+                
+        except Exception as e:
+            logger.warning(f"Proxy service download failed: {str(e)}")
+        
+        # Third attempt: Try with simpler options as a last resort
+        logger.info("Trying fallback download options")
+        fallback_ydl_opts = {
+            'format': 'worstaudio/worst',  # Try worst quality as a last resort
+            'outtmpl': str(output_path),
+            'quiet': False,
+            'noplaylist': True,
+        }
+        
+        with yt_dlp.YoutubeDL(fallback_ydl_opts) as ydl:
+            ydl.download([url])
         
         # Check if any file was downloaded
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            raise RuntimeError("Failed to download video after multiple attempts")
+            # Try one more time with a different URL format (sometimes helps with YouTube)
+            if 'youtu.be' in url:
+                new_url = url.replace('youtu.be/', 'youtube.com/watch?v=')
+                logger.info(f"Trying alternative URL format: {new_url}")
+                with yt_dlp.YoutubeDL(fallback_ydl_opts) as ydl:
+                    ydl.download([new_url])
+            
+            # If still no file, raise error
+            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                raise RuntimeError("Failed to download video after multiple attempts. Try a different video or manually download the audio.")
             
         return str(output_path)
+    
+    def _extract_youtube_id(self, url):
+        """
+        Extract YouTube video ID from URL.
+        
+        Args:
+            url (str): YouTube URL.
+            
+        Returns:
+            str: YouTube video ID or None if not found.
+        """
+        # Regular expressions for different YouTube URL formats
+        patterns = [
+            r'(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{11})',
+            r'youtube\.com/embed/([a-zA-Z0-9_-]{11})',
+            r'youtube\.com/v/([a-zA-Z0-9_-]{11})',
+            r'youtube\.com/shorts/([a-zA-Z0-9_-]{11})'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+                
+        return None
+    
+    def _download_via_invidious(self, video_id, output_path):
+        """
+        Download video using Invidious proxy.
+        
+        Args:
+            video_id (str): YouTube video ID.
+            output_path (Path): Output file path.
+            
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        # List of Invidious instances to try
+        instances = [
+            "https://invidious.snopyta.org",
+            "https://yewtu.be",
+            "https://invidious.kavin.rocks",
+            "https://vid.puffyan.us"
+        ]
+        
+        for instance in instances:
+            try:
+                # Get video info from Invidious API
+                api_url = f"{instance}/api/v1/videos/{video_id}"
+                response = requests.get(api_url, timeout=10)
+                
+                if response.status_code != 200:
+                    continue
+                    
+                data = response.json()
+                
+                # Find audio stream
+                audio_streams = [f for f in data.get('adaptiveFormats', []) 
+                               if f.get('type', '').startswith('audio')]
+                
+                if not audio_streams:
+                    continue
+                    
+                # Get the best quality audio
+                audio_stream = sorted(audio_streams, 
+                                    key=lambda x: x.get('bitrate', 0), 
+                                    reverse=True)[0]
+                
+                audio_url = audio_stream.get('url')
+                
+                if not audio_url:
+                    continue
+                    
+                # Download the audio file
+                audio_response = requests.get(audio_url, stream=True, timeout=30)
+                
+                if audio_response.status_code != 200:
+                    continue
+                    
+                with open(output_path, 'wb') as f:
+                    for chunk in audio_response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        
+                return True
+                
+            except Exception as e:
+                logger.warning(f"Invidious instance {instance} failed: {str(e)}")
+                continue
+                
+        return False
+    
+    def _download_via_y2mate(self, video_id, output_path):
+        """
+        Download video using Y2mate service.
+        
+        Args:
+            video_id (str): YouTube video ID.
+            output_path (Path): Output file path.
+            
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        try:
+            # This is a simplified implementation
+            # In a real implementation, you would need to reverse engineer
+            # the current Y2mate API which changes frequently
+            
+            # Step 1: Create a session and get a download link
+            session = requests.Session()
+            
+            # Use a URL that's less likely to be blocked
+            youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+            encoded_url = urllib.parse.quote(youtube_url)
+            
+            # Step 2: Get download links (this is a simplified example)
+            # In reality, this would involve multiple requests and parsing responses
+            api_url = f"https://www.y2mate.com/mates/analyze/ajax"
+            
+            payload = {
+                'url': youtube_url,
+                'q_auto': 0,
+                'ajax': 1
+            }
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Origin': 'https://www.y2mate.com',
+                'Referer': f'https://www.y2mate.com/youtube/{video_id}'
+            }
+            
+            # This is a simplified implementation
+            # In reality, you would need to handle multiple requests and parse responses
+            
+            # For demonstration purposes, we'll use a more direct approach
+            # that doesn't rely on the actual Y2mate API
+            
+            # Use a YouTube frontend that provides direct download links
+            alternative_url = f"https://www.y2mate.com/youtube/{video_id}"
+            
+            # Since we can't fully implement the Y2mate API here,
+            # we'll return False to try other methods
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Y2mate download failed: {str(e)}")
+            return False
+    
+    def _download_via_alternative_domain(self, video_id, output_path):
+        """
+        Download video using alternative YouTube domains.
+        
+        Args:
+            video_id (str): YouTube video ID.
+            output_path (Path): Output file path.
+            
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        # Alternative domains that might bypass restrictions
+        domains = [
+            "youtube.com",
+            "youtubepp.com",
+            "youtube-nocookie.com"
+        ]
+        
+        for domain in domains:
+            try:
+                url = f"https://www.{domain}/watch?v={video_id}"
+                
+                ydl_opts = {
+                    'format': 'bestaudio/best',
+                    'outtmpl': str(output_path),
+                    'quiet': False,
+                    'noplaylist': True,
+                }
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+                    
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    return True
+                    
+            except Exception as e:
+                logger.warning(f"Alternative domain {domain} failed: {str(e)}")
+                continue
+                
+        return False
+    
+    def _download_direct_audio_url(self, video_id, output_path):
+        """
+        Attempt to download audio directly from known URL patterns.
+        
+        Args:
+            video_id (str): YouTube video ID.
+            output_path (Path): Output file path.
+            
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        try:
+            # Try to get audio via a public API that doesn't require authentication
+            api_url = f"https://pipedapi.kavin.rocks/streams/{video_id}"
+            
+            response = requests.get(api_url, timeout=10)
+            
+            if response.status_code != 200:
+                return False
+                
+            data = response.json()
+            
+            # Find audio stream
+            audio_streams = [s for s in data.get('audioStreams', []) 
+                           if s.get('url')]
+            
+            if not audio_streams:
+                return False
+                
+            # Get the best quality audio
+            audio_stream = sorted(audio_streams, 
+                                key=lambda x: int(x.get('bitrate', 0)), 
+                                reverse=True)[0]
+            
+            audio_url = audio_stream.get('url')
+            
+            if not audio_url:
+                return False
+                
+            # Download the audio file
+            audio_response = requests.get(audio_url, stream=True, timeout=30)
+            
+            if audio_response.status_code != 200:
+                return False
+                
+            with open(output_path, 'wb') as f:
+                for chunk in audio_response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    
+            return True
+            
+        except Exception as e:
+            logger.warning(f"Direct audio URL download failed: {str(e)}")
+            return False
     
     def _extract_audio(self, video_path):
         """
