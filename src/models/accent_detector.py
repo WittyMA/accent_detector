@@ -1,6 +1,6 @@
 """
 Accent detection module for English speech analysis.
-Handles accent classification and confidence scoring with robust fallback mechanisms.
+Handles accent classification and confidence scoring with robust language identification.
 """
 
 import os
@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 class AccentDetector:
-    """Class to handle accent detection and confidence scoring with fallback mechanisms."""
+    """Class to handle accent detection and confidence scoring with robust language identification."""
     
     # Common English accent types
     ACCENT_TYPES = [
@@ -31,6 +31,12 @@ class AccentDetector:
         "Scottish",
         "South African",
         "New Zealand"
+    ]
+    
+    # Language codes for common non-English languages
+    NON_ENGLISH_LANGS = [
+        "fr", "de", "es", "it", "pt", "ru", "zh", "ja", "ko", "ar", 
+        "hi", "tr", "nl", "pl", "sv", "hu", "fi", "da", "no"
     ]
     
     def __init__(self, model_dir=None):
@@ -169,6 +175,19 @@ class AccentDetector:
             # Log the first few labels to verify
             logger.info(f"First few language labels: {self.language_labels[:5]}")
             
+            # Create a mapping of language codes to indices
+            self.language_indices = {}
+            for i, lang in enumerate(self.language_labels):
+                lang_str = str(lang).lower()
+                self.language_indices[lang_str] = i
+                # Also add shortened versions (e.g., "en" for "eng-us")
+                if "-" in lang_str:
+                    short_code = lang_str.split("-")[0]
+                    if short_code not in self.language_indices:
+                        self.language_indices[short_code] = i
+            
+            logger.info(f"Created language index mapping with {len(self.language_indices)} entries")
+            
         except Exception as e:
             logger.error(f"Error getting language labels: {str(e)}")
             # Fallback: Create a basic list of language codes
@@ -177,6 +196,7 @@ class AccentDetector:
                 "en", "de", "fr", "es", "it", "pt", "nl", "pl", "ru", "zh",
                 "ja", "ko", "ar", "hi", "tr", "sv", "hu", "fi", "da", "no"
             ]
+            self.language_indices = {lang: i for i, lang in enumerate(self.language_labels)}
     
     def detect_accent(self, audio_path):
         """
@@ -203,11 +223,23 @@ class AccentDetector:
             if self.using_fallback:
                 accent, confidence, explanation = self._fallback_classify_accent(audio_data, sample_rate)
             else:
+                # First, determine if the audio is English
+                is_english, language_probs = self._identify_language(audio_data)
+                
+                if not is_english:
+                    # Get the most likely non-English language
+                    top_lang = self._get_top_language(language_probs)
+                    return {
+                        "accent": "Non-English",
+                        "confidence_score": language_probs.get(top_lang, 70.0),
+                        "explanation": f"Speech appears to be in {top_lang.upper()} rather than English."
+                    }
+                
                 # Extract features for accent detection
                 features = self._extract_features(audio_data, sample_rate)
                 
                 # Classify accent
-                accent, confidence, explanation = self._classify_accent(features, audio_data, sample_rate)
+                accent, confidence, explanation = self._classify_accent(features, audio_data, sample_rate, language_probs)
             
             result = {
                 "accent": accent,
@@ -228,6 +260,133 @@ class AccentDetector:
                 "confidence_score": 0.0,
                 "explanation": f"Error detecting accent: {str(e)}"
             }
+    
+    def _identify_language(self, audio_data):
+        """
+        Identify if the audio is in English or another language.
+        
+        Args:
+            audio_data (numpy.ndarray): Audio data.
+            
+        Returns:
+            tuple: (is_english, language_probabilities)
+                is_english (bool): True if the audio is likely English
+                language_probabilities (dict): Dictionary mapping language codes to probabilities
+        """
+        logger.info("Identifying language of audio")
+        
+        # Default to English with moderate probability if language ID fails
+        default_result = (True, {"en": 70.0})
+        
+        try:
+            if not hasattr(self, 'language_id') or not hasattr(self, 'language_labels'):
+                logger.warning("Language ID model not available, assuming English")
+                return default_result
+            
+            with torch.no_grad():
+                language_prediction = self.language_id.classify_batch(torch.tensor([audio_data]))
+                language_scores = language_prediction[0]  # Get scores
+                language_score_dict = {}
+                
+                # Calculate probabilities for all languages
+                for i, lang in enumerate(self.language_labels):
+                    if i < language_scores.shape[1]:
+                        lang_str = str(lang).lower()
+                        score = language_scores[0][i].item() * 100  # Convert to percentage
+                        language_score_dict[lang_str] = score
+                
+                # If we couldn't get scores for all languages, use what we have
+                if not language_score_dict:
+                    logger.warning("Could not extract language scores, using defaults")
+                    return default_result
+                
+                # Get English probability
+                english_prob = 0.0
+                for lang, score in language_score_dict.items():
+                    if lang.startswith("en"):
+                        english_prob += score / 100.0  # Convert back to 0-1 scale for calculation
+                
+                # Get probabilities for common non-English languages
+                non_english_probs = {}
+                for lang_code in self.NON_ENGLISH_LANGS:
+                    prob = 0.0
+                    for lang, score in language_score_dict.items():
+                        if lang.startswith(lang_code):
+                            prob += score / 100.0  # Convert back to 0-1 scale
+                    if prob > 0:
+                        non_english_probs[lang_code] = prob
+                
+                # Find the highest non-English probability
+                top_non_english = 0.0
+                top_lang = None
+                for lang, prob in non_english_probs.items():
+                    if prob > top_non_english:
+                        top_non_english = prob
+                        top_lang = lang
+                
+                # Determine if English based on relative probabilities
+                # English must be significantly more likely than other languages
+                is_english = english_prob > 0.4 and (english_prob > top_non_english * 1.2)
+                
+                # Convert probabilities back to percentages for return value
+                result_probs = {"en": english_prob * 100}
+                for lang, prob in non_english_probs.items():
+                    result_probs[lang] = prob * 100
+                
+                logger.info(f"Language identification: English={english_prob*100:.1f}%, " +
+                           f"Top non-English={top_lang}={top_non_english*100:.1f}%")
+                logger.info(f"Is English: {is_english}")
+                
+                return is_english, result_probs
+                
+        except Exception as e:
+            logger.error(f"Error in language identification: {str(e)}")
+            logger.error(f"Language ID traceback: {traceback.format_exc()}")
+            return default_result
+    
+    def _get_top_language(self, language_probs):
+        """
+        Get the most likely language from probability dictionary.
+        
+        Args:
+            language_probs (dict): Dictionary mapping language codes to probabilities.
+            
+        Returns:
+            str: The most likely language code.
+        """
+        # Remove English from consideration
+        non_english_probs = {k: v for k, v in language_probs.items() if not k.startswith("en")}
+        
+        if not non_english_probs:
+            return "unknown"
+            
+        # Find the language with highest probability
+        top_lang = max(non_english_probs.items(), key=lambda x: x[1])[0]
+        
+        # Map common language codes to full names
+        lang_names = {
+            "fr": "French",
+            "de": "German",
+            "es": "Spanish",
+            "it": "Italian",
+            "pt": "Portuguese",
+            "ru": "Russian",
+            "zh": "Chinese",
+            "ja": "Japanese",
+            "ko": "Korean",
+            "ar": "Arabic",
+            "hi": "Hindi",
+            "tr": "Turkish",
+            "nl": "Dutch",
+            "pl": "Polish",
+            "sv": "Swedish",
+            "hu": "Hungarian",
+            "fi": "Finnish",
+            "da": "Danish",
+            "no": "Norwegian"
+        }
+        
+        return lang_names.get(top_lang, top_lang.upper())
     
     def _load_audio(self, audio_path):
         """
@@ -313,7 +472,7 @@ class AccentDetector:
                 'speech_rate': 0
             }
     
-    def _classify_accent(self, features, audio_data, sample_rate):
+    def _classify_accent(self, features, audio_data, sample_rate, language_probs):
         """
         Classify accent based on extracted features.
         
@@ -321,6 +480,7 @@ class AccentDetector:
             features (dict): Extracted audio features.
             audio_data (numpy.ndarray): Audio data for additional processing.
             sample_rate (int): Sample rate.
+            language_probs (dict): Language probability scores.
             
         Returns:
             tuple: (accent_type, confidence_score, explanation)
@@ -328,73 +488,6 @@ class AccentDetector:
         logger.info("Classifying accent")
         
         try:
-            # Use language ID model to get language probabilities if available
-            english_prob = 0.8  # Default probability if model fails
-            
-            if hasattr(self, 'language_id') and hasattr(self, 'language_labels'):
-                try:
-                    with torch.no_grad():
-                        language_prediction = self.language_id.classify_batch(torch.tensor([audio_data]))
-                        language_scores = language_prediction[0]  # Get scores
-                    
-                    # Check if it's English first (using language ID model)
-                    english_langs = ["en", "eng"]
-                    english_indices = []
-                    
-                    # Try to find English indices in language labels
-                    for i, lang in enumerate(self.language_labels):
-                        lang_str = str(lang).lower()
-                        if any(eng in lang_str for eng in english_langs):
-                            english_indices.append(i)
-                    
-                    # If no English indices found, use a fallback approach
-                    if not english_indices:
-                        logger.warning("No English language indices found, using fallback approach")
-                        # If still no English indices, use the first few indices as a last resort
-                        if len(self.language_labels) > 0:
-                            logger.warning("Using first index as fallback for English")
-                            english_indices = [0]  # Assume first label might be English
-                    
-                    # Sum probabilities of all English variants
-                    try:
-                        # Ensure we're working with valid indices
-                        valid_indices = [i for i in english_indices if i < language_scores.shape[1]]
-                        if valid_indices:
-                            english_prob = sum(language_scores[0][i].item() for i in valid_indices)
-                            # Ensure probability is between 0 and 1
-                            english_prob = max(0.0, min(1.0, english_prob))
-                        else:
-                            # If no valid indices, use default probability
-                            english_prob = 0.8
-                    except (IndexError, TypeError) as e:
-                        logger.error(f"Error calculating English probability: {str(e)}")
-                        # Fallback to a default probability
-                        english_prob = 0.8
-                    
-                    logger.info(f"English probability: {english_prob}")
-                    
-                except Exception as lang_e:
-                    logger.error(f"Error in language identification: {str(lang_e)}")
-                    logger.error(f"Language ID traceback: {traceback.format_exc()}")
-                    # Continue with default probability
-            
-            # For YouTube videos, assume English with high probability
-            # This is a heuristic to avoid false negatives
-            if english_prob < 0.5:
-                logger.warning(f"Low English probability detected: {english_prob}, using heuristic override")
-                # Check for speech activity as a heuristic
-                speech_activity = np.mean(np.abs(audio_data)) > 0.01
-                if speech_activity:
-                    english_prob = 0.7  # Override with moderate probability for speech
-                    logger.info(f"Speech activity detected, overriding English probability to: {english_prob}")
-            
-            # If still not likely English, return low confidence
-            if english_prob < 0.3:  # Lower threshold to avoid false negatives
-                return "Non-English", english_prob * 100, "Speech does not appear to be in English."
-            
-            # For English speech, determine the specific accent
-            # This is a simplified approach using feature-based heuristics
-            
             # Extract key features that help differentiate accents
             mfcc_mean = features['mfcc_mean']
             pitch_mean = features['pitch_mean']
@@ -426,11 +519,8 @@ class AccentDetector:
                     accent = "Irish"
                     explanation = "Detected melodic speech patterns and distinctive vowel sounds typical of Irish English."
             
-            # Calculate confidence score (simplified approach)
-            # In a real system, this would be based on model probabilities
-            
-            # Base confidence on English probability
-            base_confidence = english_prob * 100
+            # Calculate confidence score based on language probabilities
+            english_prob = language_probs.get("en", 70.0)
             
             # Adjust based on feature clarity
             feature_confidence = min(100, max(50, 
@@ -440,7 +530,7 @@ class AccentDetector:
             ))
             
             # Final confidence is weighted average
-            confidence = (0.7 * base_confidence + 0.3 * feature_confidence)
+            confidence = (0.7 * english_prob + 0.3 * feature_confidence)
             
             # Ensure confidence is within reasonable bounds
             confidence = max(0.0, min(100.0, confidence))
